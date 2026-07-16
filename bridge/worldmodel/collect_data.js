@@ -24,6 +24,8 @@ const OUT = process.argv[2] ||
   path.join(ROOT, 'bridge', 'results', `collect_${Math.floor(Date.now() / 1000)}_trace.jsonl`);
 const out = fs.createWriteStream(OUT);
 const emit = o => out.write(JSON.stringify(o) + '\n');
+// provenance meta record — the synthetic-data guard (wmcommon.py) requires it
+emit({ kind: 'meta', real: true, source: 'physics-collector', policy: 'scripted-random' });
 
 // episode matrix: terrain variety + water + metabolic scales, all seeded
 const CONFIGS = [];

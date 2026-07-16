@@ -24,26 +24,19 @@ import hashlib
 import json
 import math
 import os
+import sys
 
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from wmcommon import COMPASS, contiguous, load_trace_records, slope_toward  # noqa: E402
+
 RESULTS_DIR = os.path.join(HERE, "..", "results")
-COMPASS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 FEATURE_NAMES = (["energy_kJ", "slope_heading_pct"]
                  + [f"slope_{d}_pct" for d in COMPASS]
                  + ["speed_ms", "wading", "metab"])
 TARGET_NAMES = ["delta_energy_kJ", "displacement_m"]
-
-
-def slope_toward(slope_pct, heading_deg):
-    """Interpolate the 8 compass slope readings toward an arbitrary heading."""
-    h = heading_deg % 360
-    i = int(h // 45)
-    frac = (h - i * 45) / 45
-    a = slope_pct[COMPASS[i]]
-    b = slope_pct[COMPASS[(i + 1) % 8]]
-    return a * (1 - frac) + b * frac
 
 
 def obs_features(obs, action):
@@ -60,21 +53,19 @@ def obs_features(obs, action):
 
 
 def transitions_from_file(path):
-    """Yield (episode_key, x, y) transitions from one trace file."""
+    """Yield (episode_key, x, y) transitions from one trace file.
+    Enforces the synthetic-data guard: raises SyntheticDataError on untagged
+    or implausible (frozen-position) data."""
+    _, records = load_trace_records(path, require_real=True)
     by_agent = {}
-    with open(path) as f:
-        for line in f:
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if rec.get("kind") != "decision":
-                continue
-            obs = rec.get("obs") or {}
-            if "slope_pct" not in obs or "pos_m" not in obs:
-                continue
-            key = (rec.get("episode", -1), rec.get("agent", "?"))
-            by_agent.setdefault(key, []).append(rec)
+    for rec in records:
+        if rec.get("kind") != "decision":
+            continue
+        obs = rec.get("obs") or {}
+        if "slope_pct" not in obs or "pos_m" not in obs:
+            continue
+        key = (rec.get("episode", -1), rec.get("agent", "?"))
+        by_agent.setdefault(key, []).append(rec)
 
     for (ep, agent), recs in by_agent.items():
         recs.sort(key=lambda r: r["t_s"])
@@ -82,8 +73,7 @@ def transitions_from_file(path):
         seq_key = f"{ep_key}|{agent}"
         for r1, r2 in zip(recs, recs[1:]):
             o1, o2 = r1["obs"], r2["obs"]
-            dt = o2["t_s"] - o1["t_s"]
-            if not (1.5 <= dt <= 2.5):
+            if not contiguous(o1["t_s"], o2["t_s"]):
                 continue
             if o2.get("eaten", 0) > o1.get("eaten", 0):
                 continue                                    # discrete eat event

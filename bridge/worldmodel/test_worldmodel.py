@@ -28,11 +28,13 @@ def _obs(x, z, energy, t, eaten=0, slopes=None):
     }
 
 
-def _write_trace(path, n=8):
+def _write_trace(path, n=8, meta=True, frozen=False):
     with open(path, "w") as f:
+        if meta:
+            f.write(json.dumps({"kind": "meta", "real": True, "source": "physics-collector"}) + "\n")
         for i in range(n):
             rec = {"kind": "decision", "episode": 0, "agent": "Amber", "t_s": 2.0 * (i + 1),
-                   "obs": _obs(10 + i, 10, 400 - 5 * i, 2.0 * (i + 1),
+                   "obs": _obs(10 if frozen else 10 + i, 10, 400 - 5 * i, 2.0 * (i + 1),
                                eaten=1 if i >= 5 else 0),
                    "action": {"heading_deg": 90.0, "speed": 1.2, "reason": "t", "memory": ""},
                    "latency_s": 0}
@@ -67,6 +69,97 @@ def test_forward_pass_shape():
     m = DynamicsMLP(13, 2)
     y = m(torch.zeros(7, 13))
     assert y.shape == (7, 2)
+
+
+def test_synthetic_guard_fires():
+    import pytest
+    from wmcommon import SyntheticDataError, load_trace_records
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        # untagged file (pre-guard / fabricated) -> refused
+        p1 = os.path.join(td, "untagged_trace.jsonl")
+        _write_trace(p1, meta=False)
+        with pytest.raises(SyntheticDataError, match="no real-provenance"):
+            load_trace_records(p1)
+        # tagged but frozen positions (fabrication signature) -> refused
+        p2 = os.path.join(td, "frozen_trace.jsonl")
+        _write_trace(p2, meta=True, frozen=True)
+        with pytest.raises(SyntheticDataError, match="frozen positions"):
+            load_trace_records(p2)
+        # tagged, plausible -> accepted
+        p3 = os.path.join(td, "good_trace.jsonl")
+        _write_trace(p3)
+        meta, records = load_trace_records(p3)
+        assert meta["real"] is True and len(records) == 8
+
+
+def test_analytic_planner_matches_engine_cost():
+    """Oracle must reproduce Minetti + basal cost, independently integrated over
+    the known analytic 'gentle' terrain (h = 1 + 13·exp(−r²/200))."""
+    from planner import AnalyticPlanner
+
+    def terrain_h(x, z):
+        return 1 + 13 * math.exp(-((x - 25) ** 2 + (z - 25) ** 2) / 200)
+
+    def cot(g):
+        g = max(-0.45, min(0.45, g))
+        return max(1.5, 280.5 * g**5 - 58.7 * g**4 - 76.8 * g**3 + 51.9 * g * g + 19.6 * g + 2.5)
+
+    mass, metab, speed, dt = 70.0, 10, 1.4, 1 / 240
+    x, z, expected = 5.0, 45.0, 0.0
+    for _ in range(3 * 480):                     # 3 steps × 2 s at 240 Hz, heading east
+        nx = x + speed * dt
+        dh = terrain_h(nx, z) - terrain_h(x, z)
+        horiz = speed * dt
+        expected += mass * 2.0 * dt              # basal, 2 W/kg
+        expected += mass * cot(dh / horiz) * math.hypot(horiz, dh)
+        x = nx
+    expected_kJ = expected * metab / 1000
+
+    oracle = AnalyticPlanner()
+    try:
+        obs = _obs(5, 45, 400, 10.0)
+        obs.update(terrain="gentle", terrain_seed=0, world_size_m=50, metabolic_scale=10)
+        r = {c["heading_deg"]: c for c in oracle.plan(obs, horizon=3, speed=1.4)}[90]
+        assert abs(-r["net_dE_kJ"] - expected_kJ) / expected_kJ < 0.02, (r, expected_kJ)
+        assert abs(r["disp_m"] - 8.4) < 0.5, r
+        assert r["ood"] is False
+        r2 = {c["heading_deg"]: c for c in oracle.plan(obs, horizon=3, speed=1.4)}[90]
+        assert r == r2                           # deterministic
+    finally:
+        oracle.close()
+
+
+def test_paired_roles_counterbalance():
+    """Both agents share one sim episode by construction; the runner must swap
+    planner roles across episodes so spawn asymmetry cancels."""
+    import argparse
+    sys.path.insert(0, os.path.join(HERE, ".."))
+    import mind_driver
+    args = argparse.Namespace(mock=True, planner="learned", paired=True, worldmodel=False,
+                              episodes=2, seeds=None, seed=1, food_seed=1, terrain="perlin",
+                              size=50, water=0, metab=10, duration=60, food_interval=12,
+                              max_tokens=10, think=False)
+    d = mind_driver.Driver.__new__(mind_driver.Driver)   # no __init__: pure role logic
+    d.args = args
+    d.paired = True
+    d.planner = object()
+    d.planner_mode = "learned"
+    d.ep_idx = 0
+    assert d.planner_for("Amber") and not d.planner_for("Cyan")
+    assert d.roles() == {"Amber": "learned", "Cyan": "off"}
+    d.ep_idx = 1
+    assert not d.planner_for("Amber") and d.planner_for("Cyan")
+    assert d.roles() == {"Amber": "off", "Cyan": "learned"}
+    # identical world state: paired mode changes NO cfg fields
+    d2 = mind_driver.Driver.__new__(mind_driver.Driver)
+    d2.args = args
+    unpaired_args = argparse.Namespace(**{**vars(args), "paired": False})
+    d3 = mind_driver.Driver.__new__(mind_driver.Driver)
+    d3.args = unpaired_args
+    for i in range(3):
+        d2.ep_idx = d3.ep_idx = i
+        assert mind_driver.Driver.episode_cfg(d2, i) == mind_driver.Driver.episode_cfg(d3, i)
 
 
 def test_trained_model_and_rollout_determinism():

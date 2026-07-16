@@ -262,11 +262,32 @@ class Driver:
         self.iteration = 0
         self.done = None                        # set in main() for benchmark runs
         self.planner = None
-        if getattr(args, "worldmodel", False):  # lazy: torch only loads when the flag is on
+        self.paired = getattr(args, "paired", False)
+        mode = getattr(args, "planner", "off")
+        if getattr(args, "worldmodel", False) and mode == "off":
+            mode = "learned"                    # legacy alias
+        self.planner_mode = mode
+        if mode != "off":                       # lazy: torch/node only load when needed
             sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "worldmodel"))
-            from planner import Planner
-            self.planner = Planner()
-            print("world-model planner loaded (bridge/worldmodel/model.pt)", flush=True)
+            from planner import make_planner
+            self.planner = make_planner(mode)
+            print(f"planner loaded: {mode}", flush=True)
+
+    def planner_for(self, name):
+        """Planner for this agent. In --paired mode one agent plans and the other
+        doesn't, with roles swapping every episode (counterbalances spawn asymmetry)."""
+        if not self.planner:
+            return None
+        if not self.paired:
+            return self.planner
+        agent_idx = 0 if name == "Amber" else 1
+        return self.planner if (self.ep_idx + agent_idx) % 2 == 0 else None
+
+    def roles(self):
+        if not self.paired or not self.planner:
+            return {n: self.planner_mode for n in ("Amber", "Cyan")} if self.planner else None
+        return {n: (self.planner_mode if self.planner_for(n) else "off")
+                for n in ("Amber", "Cyan")}
         if not args.mock:
             from openai import AsyncOpenAI
             self.client = AsyncOpenAI(base_url=API_BASE, api_key="none")
@@ -287,6 +308,10 @@ class Driver:
 
     def trace(self, record):
         if self.trace_path:
+            if not os.path.exists(self.trace_path):   # first write: provenance meta record
+                with open(self.trace_path, "w") as f:
+                    f.write(json.dumps({"kind": "meta", "real": True, "source": "sim-ws",
+                                        "policy": str(self.tag)}) + "\n")
             with open(self.trace_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
 
@@ -295,11 +320,12 @@ class Driver:
         name = obs.get("name", "Agent")
         hist = self.history.get(name, [])
         key = obs_terrain_key(obs)
+        planner = self.planner_for(name)
         system = (SYSTEM_PROMPT.format(name=name)
                   + self.worldmem.render(name, key, obs.get("world_size_m", 50))
                   + self.journal_text(key))
-        if self.planner:
-            system += ("\n\nA PLANNER block may follow each observation: a learned dynamics model's "
+        if planner:
+            system += ("\n\nA PLANNER block may follow each observation: a world model's "
                        "prediction of energy cost and movement per candidate heading. It is usually "
                        "accurate on explored terrain and unreliable where marked UNKNOWN TERRAIN.")
         msgs = [{"role": "system", "content": system}]
@@ -307,10 +333,10 @@ class Driver:
             msgs.append({"role": "user", "content": h_obs})
             msgs.append({"role": "assistant", "content": h_act})
         user = json.dumps(obs)
-        if self.planner:
+        if planner:
             cells = self.worldmem.maps.get(f"{name}|{key}", {}).get("cells", {})
             try:
-                user += self.planner.render(self.planner.plan(obs, cells), obs)
+                user += planner.render(planner.plan(obs, cells), obs)
             except Exception as e:
                 print(f"  planner failed: {e}", flush=True)
         mem = self.memory.get(name)
@@ -358,6 +384,7 @@ class Driver:
                                           "speed": act["speed"], "reason": act["reason"]}))
                 self.trace({"kind": "decision", "episode": self.ep_idx, "agent": obs["name"],
                             "t_s": obs["t_s"], "obs": obs, "action": act,
+                            "planner": self.planner_mode if self.planner_for(obs["name"]) else "off",
                             "latency_s": round(dt, 2)})
                 print(f"  [{obs['name']}] t={obs['t_s']:>6}s E={obs['energy_kJ']}kJ "
                       f"-> {act['heading_deg']:.0f}deg @{act['speed']:.1f}m/s "
@@ -365,8 +392,9 @@ class Driver:
 
     def episode_cfg(self, i):
         a = self.args
-        return {"terrain": a.terrain, "seed": a.seed, "size": a.size, "water": a.water,
-                "metab": a.metab, "food_seed": a.food_seed + i,
+        seeds = [int(s) for s in str(a.seeds).split(",")] if getattr(a, "seeds", None) else [a.seed]
+        return {"terrain": a.terrain, "seed": seeds[i % len(seeds)], "size": a.size,
+                "water": a.water, "metab": a.metab, "food_seed": a.food_seed + i,
                 "food_interval_s": a.food_interval, "first_food_s": 4, "episode_s": a.duration}
 
     async def reflect_all(self, end_msg):
@@ -477,7 +505,8 @@ class Driver:
             print(f"episode {i+1}/{self.args.episodes} started: {cfg}", flush=True)
             end = await self.episode_end
             rec = {"model": tag, "episode": i, "cfg": cfg, "t_end_s": end["t_s"],
-                   "metrics": end["metrics"], "ts": time.time()}
+                   "planner": self.planner_mode, "paired": self.paired,
+                   "roles": self.roles(), "metrics": end["metrics"], "ts": time.time()}
             with open(out, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             for metric in end["metrics"]:               # cross-episode learning
@@ -511,7 +540,13 @@ async def main():
     ap.add_argument("--think", action="store_true", help="enable model reasoning/thinking")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--worldmodel", action="store_true",
-                    help="inject learned-dynamics planner predictions into the prompt")
+                    help="deprecated alias for --planner learned")
+    ap.add_argument("--planner", choices=["off", "learned", "analytic"], default="off",
+                    help="lookahead source injected into the prompt")
+    ap.add_argument("--paired", action="store_true",
+                    help="within-episode control: one agent plans, the other doesn't; roles swap per episode")
+    ap.add_argument("--seeds", default=None,
+                    help="comma list of terrain seeds cycled across episodes (overrides --seed)")
     args = ap.parse_args()
 
     if args.probe:
