@@ -272,6 +272,9 @@ class Driver:
             from planner import make_planner
             self.planner = make_planner(mode)
             print(f"planner loaded: {mode}", flush=True)
+        if not args.mock:
+            from openai import AsyncOpenAI
+            self.client = AsyncOpenAI(base_url=API_BASE, api_key="none")
 
     def planner_for(self, name):
         """Planner for this agent. In --paired mode one agent plans and the other
@@ -288,9 +291,6 @@ class Driver:
             return {n: self.planner_mode for n in ("Amber", "Cyan")} if self.planner else None
         return {n: (self.planner_mode if self.planner_for(n) else "off")
                 for n in ("Amber", "Cyan")}
-        if not args.mock:
-            from openai import AsyncOpenAI
-            self.client = AsyncOpenAI(base_url=API_BASE, api_key="none")
 
     def save_journal(self):
         os.makedirs(MEMORY_DIR, exist_ok=True)

@@ -42,7 +42,10 @@ VENV_PY = os.path.join(ROOT, "venv", "bin", "python")
 RESULTS = os.path.join(BRIDGE, "results")
 MEMORY = os.path.join(BRIDGE, "memory")
 CHROMIUM = shutil.which("chromium") or "/snap/bin/chromium"
-SIM_URL = "http://127.0.0.1:8388/?control=llm&ws=ws://127.0.0.1:8390"
+
+
+def sim_url(port):
+    return f"http://127.0.0.1:8388/?control=llm&ws=ws://127.0.0.1:{port}"
 
 CONDITION_FLAGS = {
     "mock": ["--mock"],
@@ -70,16 +73,25 @@ def wipe_memory(tag):
 def run_condition(name, extra_flags, args):
     print(f"\n=== condition: {name} ===", flush=True)
     before = set(glob.glob(os.path.join(RESULTS, "*.jsonl")))
+    port = getattr(args, "port", 8390)
     cmd = [VENV_PY, os.path.join(BRIDGE, "mind_driver.py"),
            "--episodes", str(args.episodes), "--duration", str(args.duration),
            "--terrain", args.terrain, "--seeds", args.seeds,
            "--food-seed", str(args.food_seed), "--metab", str(args.metab),
-           "--size", str(args.size)] + extra_flags
+           "--size", str(args.size), "--port", str(port)] + extra_flags
     driver = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     time.sleep(2)
+    if driver.poll() is not None:               # instant death (port conflict, crash): say why
+        print(f"  DRIVER DIED at startup (exit {driver.returncode}):", flush=True)
+        for line in driver.stdout.read().splitlines()[-8:]:
+            print("  ! " + line, flush=True)
+        return None, None
+    # unique debug port + profile dir so parallel ablation instances coexist
     browser = subprocess.Popen(
         [CHROMIUM, "--headless=new", "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
-         "--remote-debugging-port=9223", "--window-size=1200,800", SIM_URL],
+         f"--remote-debugging-port={9223 + port - 8390}",
+         f"--user-data-dir=/tmp/hillsim-chrome-{port}",
+         "--window-size=1200,800", sim_url(port)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.time() + args.episodes * (args.duration + 90) + 300
     try:
@@ -92,6 +104,8 @@ def run_condition(name, extra_flags, args):
             driver.send_signal(signal.SIGTERM)
     finally:
         browser.terminate()
+        if driver.poll() is None:               # never leave a driver squatting on the port
+            driver.terminate()
         try:
             driver.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -113,6 +127,10 @@ def main():
     ap.add_argument("--metab", type=int, default=15)
     ap.add_argument("--size", type=int, default=50)
     ap.add_argument("--conditions", default="mock,off,learned,analytic")
+    ap.add_argument("--port", type=int, default=8390,
+                    help="driver WS port — use distinct ports to run instances in parallel "
+                         "(NOTE: only the CPU-only mock condition parallelises fairly; "
+                         "LLM conditions share Delphi's single sequence slot)")
     args = ap.parse_args()
 
     tag = model_tag()

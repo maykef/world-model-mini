@@ -92,20 +92,33 @@ coordinates — the planner flags those paths as out-of-distribution instead.
 - **Integration**: `mind_driver.py --worldmodel` injects a compact per-heading
   prediction block into the prompt. Flag-gated, additive; protocol and physics untouched.
 
-**Ablation** (same seeds: perlin:1337, food seeds 777–779, 3×240 s, metab 15×,
-memory wiped per condition; `ablation.py`):
+**Scaled ablation** (n = 30 agent-episodes per condition; 15 episodes × 2 agents,
+byte-identical seed sets across conditions, terrain seeds 1337/42/2718/9001/31415,
+240 s, metab 15×, memory wiped per condition; bootstrap/Wilson 95 % CIs):
 
-| condition | survival | mean survived (s) | mean eaten | mean final kJ | latency (s) |
-|---|---|---|---|---|---|
-| heuristic (mock)   | 50 % | 144 | 2.3 | 192 | 0.0 |
-| qwen3.5, no WM     | 50 % | 137 | 1.5 | 271 | 4.1 |
-| qwen3.5, **+WM**   | **67 %** | **188** | 1.8 | **364** | 4.6 |
+| condition | n | survival [95% CI] | survived s | final kJ | eaten | latency s |
+|---|---|---|---|---|---|---|
+| heuristic (mock)     | 30 | 0.57 [0.39, 0.73] | 153 [117, 187] | 331 | 3.0 | 0.0 |
+| qwen3.5, planner off | 30 | 0.37 [0.22, 0.54] | 114 [80, 149]  | 207 | 1.3 | 3.5 |
+| qwen3.5, learned WM  | 30 | 0.40 [0.25, 0.58] | 125 [92, 161]  | 226 | 1.0 | 3.9 |
+| qwen3.5, analytic WM | 30 | **0.60 [0.42, 0.75]** | **159 [123, 193]** | **358** | 2.0 | 4.1 |
 
-With the world model the LLM survived more (both agents finishing alive twice),
-lived ~37 % longer, and banked ~34 % more final energy for +0.5 s decision latency.
-Honest caveats: n = 6 agent-episodes per condition — suggestive, not significant;
-and the bare LLM did *not* beat the heuristic on survival, so foresight (not raw
-intelligence) appears to be what pays here.
+**What held and what didn't.** The earlier n=6 pilot's headline (learned WM 67 % vs
+50 %) did **not** survive scaling: learned (0.40) vs off (0.37) is a null result, and
+the paired within-episode design (one agent with the learned planner, one without,
+roles counterbalanced, 15 pairs) confirms it cleanly — paired survival-time
+difference −12 s [−94, +69], alive-rate difference −0.07 [−0.47, +0.33]. The
+**analytic oracle**, injecting *ground-truth* per-heading costs in the identical
+prompt format, DID work: +23 points survival over planner-off, +45 s lifespan,
++73 % final energy. So it is not "any foresight helps" — it is **accurate foresight
+helps, and the learned model isn't accurate enough where it matters**: its held-out
+prediction error looks small on average (per-heading ΔE MAE 3.5 kJ vs oracle; mean
+choice regret 1.8 kJ, p90 4.2 kJ), but the pred-vs-actual scatter shows it
+*underpredicts exactly the extreme slope costs that kill agents*, and with a fresh
+map each episode its rollout truncates to 1 step (OOD) while the oracle sees three.
+Also humbling: the energy-greedy heuristic (0.57) statistically matches the
+oracle-equipped LLM (0.60) at zero latency — in this world, deliberation adds
+nothing beyond accurate greedy foresight. All raw rows: `scaled_ablation_combined.csv`.
 
 ## Roadmap
 
