@@ -1,0 +1,426 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hill Physics Sandbox</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #14171c; color: #dfe4ea; font: 14px/1.45 system-ui, sans-serif; }
+  header { padding: 10px 16px 4px; }
+  header h1 { margin: 0; font-size: 17px; font-weight: 650; }
+  header p { margin: 2px 0 0; color: #8a94a3; font-size: 12.5px; }
+  .wrap { display: flex; gap: 12px; padding: 10px 16px 16px; flex-wrap: wrap; }
+  .stage { flex: 1 1 560px; min-width: 320px; }
+  canvas { width: 100%; display: block; border-radius: 10px; background: #0d0f13; cursor: crosshair; }
+  .hint { color: #7c8695; font-size: 12px; margin-top: 6px; }
+  .panel { flex: 0 0 268px; display: flex; flex-direction: column; gap: 10px; }
+  .card { background: #1c2027; border: 1px solid #2a303a; border-radius: 10px; padding: 10px 12px; }
+  .card h2 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: #8a94a3; }
+  label.row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 6px 0; font-size: 12.5px; }
+  label.row span.val { color: #9fb4d8; min-width: 72px; text-align: right; font-variant-numeric: tabular-nums; }
+  input[type=range] { flex: 1; accent-color: #5b8def; }
+  select, button { background: #262c36; color: #dfe4ea; border: 1px solid #343c49; border-radius: 7px; padding: 5px 9px; font: inherit; }
+  button { cursor: pointer; }
+  button:hover { background: #2f3743; }
+  .btns { display: flex; gap: 6px; flex-wrap: wrap; }
+  .stats { font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .stats div { display: flex; justify-content: space-between; margin: 2px 0; }
+  .stats .k { color: #8a94a3; }
+  .full { width: 100%; }
+  label.chk { display: flex; gap: 6px; align-items: center; font-size: 12.5px; margin-top: 6px; }
+</style>
+
+<header>
+  <h1>Hill Physics Sandbox</h1>
+  <p>Real-unit rigid-body physics: gravity, rolling &amp; sliding friction, rolling resistance, air drag, restitution. World is 50 m wide.</p>
+</header>
+
+<div class="wrap">
+  <div class="stage">
+    <canvas id="cv"></canvas>
+    <div class="hint">Click to drop a ball · click-drag to launch with velocity · click a ball to select it · Space pauses</div>
+  </div>
+
+  <div class="panel">
+    <div class="card">
+      <h2>World</h2>
+      <label class="row">Terrain
+        <select id="terrain" class="full">
+          <option value="gentle">Gentle hill</option>
+          <option value="steep">Steep hill</option>
+          <option value="valley">Valley (oscillator)</option>
+          <option value="ramp">Hill with jump ramp</option>
+          <option value="bumpy">Bumpy hill</option>
+        </select>
+      </label>
+      <label class="row">Gravity
+        <select id="gpreset">
+          <option value="9.81">Earth</option>
+          <option value="1.62">Moon</option>
+          <option value="3.71">Mars</option>
+          <option value="24.79">Jupiter</option>
+        </select>
+      </label>
+      <label class="row"><input type="range" id="g" min="0.5" max="30" step="0.01" value="9.81"><span class="val" id="gv">9.81 m/s²</span></label>
+      <label class="row">Air ρ<input type="range" id="rho" min="0" max="3" step="0.025" value="1.225"><span class="val" id="rhov">1.23 kg/m³</span></label>
+      <label class="row">Speed<input type="range" id="speed" min="0.1" max="2" step="0.05" value="1"><span class="val" id="speedv">1.0×</span></label>
+    </div>
+
+    <div class="card">
+      <h2>Ball</h2>
+      <label class="row">Material
+        <select id="mat">
+          <option value="rubber">Rubber</option>
+          <option value="steel">Steel</option>
+          <option value="wood">Wood</option>
+          <option value="ice">Ice</option>
+        </select>
+      </label>
+      <label class="row">Radius<input type="range" id="rad" min="0.2" max="1.2" step="0.05" value="0.5"><span class="val" id="radv">0.50 m</span></label>
+      <label class="row">Friction μ<input type="range" id="mu" min="0" max="1.2" step="0.01" value="0.9"><span class="val" id="muv">0.90</span></label>
+      <label class="row">Bounce e<input type="range" id="rest" min="0" max="0.95" step="0.01" value="0.75"><span class="val" id="restv">0.75</span></label>
+      <label class="row">Roll res.<input type="range" id="crr" min="0" max="0.06" step="0.001" value="0.015"><span class="val" id="crrv">0.015</span></label>
+      <label class="chk"><input type="checkbox" id="trails"> Show trails</label>
+    </div>
+
+    <div class="card">
+      <h2>Actions</h2>
+      <div class="btns">
+        <button id="drop">Drop at hilltop</button>
+        <button id="pause">Pause</button>
+        <button id="clear">Clear balls</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Selected ball</h2>
+      <div class="stats" id="stats"><div><span class="k">—</span><span>drop a ball</span></div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+// ---------- world ----------
+const W = 50, VIEW_H = 26;           // metres
+const DT = 1 / 240;                  // physics substep (s)
+const CD = 0.47;                     // drag coefficient, sphere
+
+const TERRAINS = {
+  gentle: x => 1.5 + 13 / (1 + Math.exp((x - 16) / 4.5)),
+  steep:  x => 1.5 + 16 / (1 + Math.exp((x - 11) / 2.2)),
+  valley: x => 1.5 + 13 * Math.pow((x - 25) / 23, 2),
+  ramp:   x => 1.5 + 13 / (1 + Math.exp((x - 14) / 3.5)) + 3.2 * Math.exp(-Math.pow((x - 27) / 2.2, 2)),
+  bumpy:  x => 1.5 + 13 / (1 + Math.exp((x - 16) / 4.5)) + 0.7 * Math.sin(1.1 * x),
+};
+
+const MATERIALS = {
+  rubber: { density: 1100, mu: 0.9,  e: 0.75, crr: 0.015, tint: 0 },
+  steel:  { density: 7850, mu: 0.45, e: 0.55, crr: 0.002, tint: 1 },
+  wood:   { density: 700,  mu: 0.55, e: 0.45, crr: 0.008, tint: 2 },
+  ice:    { density: 917,  mu: 0.06, e: 0.25, crr: 0.002, tint: 3 },
+};
+const COLORS = ['#e4593b', '#3b82e4', '#38b26b', '#e4b23b', '#9b59e4', '#e45b9c', '#41c8c8'];
+
+const P = {                          // live parameters (bound to UI)
+  terrain: 'gentle', g: 9.81, rho: 1.225, speed: 1,
+  mat: 'rubber', radius: 0.5, mu: 0.9, e: 0.75, crr: 0.015, trails: false,
+};
+
+let balls = [], selected = null, simTime = 0, paused = false, colorIdx = 0;
+
+function terrainH(x) { return TERRAINS[P.terrain](Math.min(W, Math.max(0, x))); }
+
+function makeBall(x, y, vx, vy) {
+  const m = MATERIALS[P.mat];
+  const r = P.radius;
+  const mass = m.density * (4 / 3) * Math.PI * r ** 3;
+  const b = {
+    x, y, vx, vy, w: 0, th: 0, r, mass,
+    I: 0.4 * mass * r * r,                       // solid sphere: 2/5 m r²
+    mu: P.mu, e: P.e, crr: P.crr,
+    color: COLORS[colorIdx++ % COLORS.length],
+    contact: 'air', trail: [],
+  };
+  balls.push(b);
+  if (balls.length > 40) { const old = balls.shift(); if (selected === old) selected = null; }
+  selected = b;
+  return b;
+}
+
+// closest point on the terrain polyline near the ball
+function closestOnTerrain(bx, by, r) {
+  const span = r + 0.6, step = 0.04;
+  let best = null, bestD2 = Infinity;
+  let px = bx - span, py = terrainH(px);
+  for (let x = bx - span + step; x <= bx + span; x += step) {
+    const qx = x, qy = terrainH(x);
+    const dx = qx - px, dy = qy - py;
+    const len2 = dx * dx + dy * dy;
+    let t = len2 > 0 ? ((bx - px) * dx + (by - py) * dy) / len2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    const cx = px + t * dx, cy = py + t * dy;
+    const d2 = (bx - cx) ** 2 + (by - cy) ** 2;
+    if (d2 < bestD2) { bestD2 = d2; best = { x: cx, y: cy }; }
+    px = qx; py = qy;
+  }
+  return { p: best, d: Math.sqrt(bestD2) };
+}
+
+function stepBall(b) {
+  // gravity + quadratic air drag
+  let ax = 0, ay = -P.g;
+  const v = Math.hypot(b.vx, b.vy);
+  if (P.rho > 0 && v > 1e-6) {
+    const fd = 0.5 * P.rho * CD * Math.PI * b.r * b.r * v * v;
+    ax -= (fd / b.mass) * b.vx / v;
+    ay -= (fd / b.mass) * b.vy / v;
+  }
+  b.vx += ax * DT; b.vy += ay * DT;
+  b.x += b.vx * DT; b.y += b.vy * DT;
+  b.th += b.w * DT;
+  b.contact = 'air';
+
+  // deep-tunnel rescue
+  if (b.y < terrainH(b.x) - b.r) { b.y = terrainH(b.x) + b.r; b.vy = 0; }
+
+  // terrain contact
+  const { p, d } = closestOnTerrain(b.x, b.y, b.r);
+  if (d < b.r) {
+    let nx, ny;
+    if (d > 1e-6 && b.y >= p.y - b.r) { nx = (b.x - p.x) / d; ny = (b.y - p.y) / d; }
+    else { nx = 0; ny = 1; }
+    if (ny < 0) { nx = -nx; ny = -ny; }
+    b.x += nx * (b.r - d); b.y += ny * (b.r - d);
+
+    const tx = -ny, ty = nx;                     // tangent
+    const vn = b.vx * nx + b.vy * ny;
+    let jn = 0;
+    if (vn < 0) {
+      const vnNew = vn < -0.8 ? -b.e * vn : 0;   // bounce only above threshold
+      jn = b.mass * (vnNew - vn);
+      b.vx += (jn / b.mass) * nx; b.vy += (jn / b.mass) * ny;
+    }
+    // friction impulse: drive contact-point slip s -> 0, clamped by Coulomb cone
+    const s = (b.vx * tx + b.vy * ty) - b.w * b.r;
+    const effK = 1 / b.mass + (b.r * b.r) / b.I; // = 7/(2m) for a solid sphere
+    const jNeeded = -s / effK;
+    const maxJ = b.mu * Math.max(jn, b.mass * P.g * DT * Math.max(ny, 0));
+    const jt = Math.max(-maxJ, Math.min(maxJ, jNeeded));
+    b.vx += (jt / b.mass) * tx; b.vy += (jt / b.mass) * ty;
+    b.w += -jt * b.r / b.I;
+    const slipping = Math.abs(jNeeded) > maxJ + 1e-12;
+    b.contact = slipping ? 'sliding' : 'rolling';
+
+    if (!slipping) {                             // rolling resistance
+      let vt = b.vx * tx + b.vy * ty;
+      const dv = b.crr * P.g * ny * DT;
+      const vtNew = Math.sign(vt) * Math.max(0, Math.abs(vt) - dv);
+      b.vx += (vtNew - vt) * tx; b.vy += (vtNew - vt) * ty;
+      b.w = vtNew / b.r;
+    }
+  }
+
+  // side walls
+  if (b.x < b.r) { b.x = b.r; b.vx = Math.abs(b.vx) * 0.4; }
+  if (b.x > W - b.r) { b.x = W - b.r; b.vx = -Math.abs(b.vx) * 0.4; }
+
+  if (P.trails) { b.trail.push(b.x, b.y); if (b.trail.length > 1200) b.trail.splice(0, 2); }
+}
+
+function ballPairs() {
+  for (let i = 0; i < balls.length; i++) for (let j = i + 1; j < balls.length; j++) {
+    const a = balls[i], b = balls[j];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const dist = Math.hypot(dx, dy), minD = a.r + b.r;
+    if (dist < minD && dist > 1e-9) {
+      const nx = dx / dist, ny = dy / dist;
+      const ia = 1 / a.mass, ib = 1 / b.mass, overlap = minD - dist;
+      a.x -= nx * overlap * ia / (ia + ib); a.y -= ny * overlap * ia / (ia + ib);
+      b.x += nx * overlap * ib / (ia + ib); b.y += ny * overlap * ib / (ia + ib);
+      const vrel = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+      if (vrel < 0) {
+        const e = Math.min(a.e, b.e);
+        const jn = -(1 + e) * vrel / (ia + ib);
+        a.vx -= jn * ia * nx; a.vy -= jn * ia * ny;
+        b.vx += jn * ib * nx; b.vy += jn * ib * ny;
+      }
+    }
+  }
+}
+
+// ---------- rendering ----------
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+let pxm = 10; // pixels per metre (device px)
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = cv.clientWidth || 800;
+  cv.width = Math.round(cssW * dpr);
+  cv.height = Math.round(cssW * dpr * VIEW_H / W);
+  cv.style.height = (cssW * VIEW_H / W) + 'px';
+  pxm = cv.width / W;
+}
+window.addEventListener('resize', resize);
+
+function draw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const sky = ctx.createLinearGradient(0, 0, 0, cv.height);
+  sky.addColorStop(0, '#1b2b45'); sky.addColorStop(1, '#2b3a52');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, cv.width, cv.height);
+
+  // world transform: metres, y up
+  ctx.setTransform(pxm, 0, 0, -pxm, 0, cv.height);
+
+  // grid every 5 m
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1 / pxm;
+  ctx.beginPath();
+  for (let x = 0; x <= W; x += 5) { ctx.moveTo(x, 0); ctx.lineTo(x, VIEW_H); }
+  for (let y = 0; y <= VIEW_H; y += 5) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+
+  // terrain
+  ctx.beginPath(); ctx.moveTo(0, 0);
+  for (let x = 0; x <= W + 0.05; x += 0.1) ctx.lineTo(x, terrainH(x));
+  ctx.lineTo(W, 0); ctx.closePath();
+  const gr = ctx.createLinearGradient(0, 0, 0, 18);
+  gr.addColorStop(0, '#2c3c2c'); gr.addColorStop(1, '#4a6b46');
+  ctx.fillStyle = gr; ctx.fill();
+  ctx.strokeStyle = '#6f9c62'; ctx.lineWidth = 2.5 / pxm; ctx.stroke();
+
+  // trails
+  if (P.trails) for (const b of balls) {
+    if (b.trail.length < 4) continue;
+    ctx.beginPath(); ctx.moveTo(b.trail[0], b.trail[1]);
+    for (let k = 2; k < b.trail.length; k += 2) ctx.lineTo(b.trail[k], b.trail[k + 1]);
+    ctx.strokeStyle = b.color + '55'; ctx.lineWidth = 1.5 / pxm; ctx.stroke();
+  }
+
+  // balls
+  for (const b of balls) {
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.fillStyle = b.color; ctx.fill();
+    ctx.lineWidth = 1.5 / pxm;
+    ctx.strokeStyle = 'rgba(0,0,0,0.4)'; ctx.stroke();
+    // rotation spoke
+    ctx.beginPath(); ctx.moveTo(b.x, b.y);
+    ctx.lineTo(b.x + b.r * Math.cos(b.th), b.y + b.r * Math.sin(b.th));
+    ctx.strokeStyle = 'rgba(255,255,255,0.75)'; ctx.stroke();
+    if (b === selected) {
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r + 0.15, 0, Math.PI * 2);
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.2 / pxm; ctx.setLineDash([0.2, 0.15]);
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+
+  // launch preview
+  if (drag && dragNow) {
+    ctx.beginPath(); ctx.moveTo(drag.x, drag.y); ctx.lineTo(dragNow.x, dragNow.y);
+    ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 2 / pxm; ctx.stroke();
+    ctx.beginPath(); ctx.arc(drag.x, drag.y, P.radius, 0, Math.PI * 2);
+    ctx.strokeStyle = '#ffd166'; ctx.stroke();
+  }
+
+  // HUD text (pixel space)
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = 'rgba(255,255,255,0.65)';
+  ctx.font = `${Math.max(11, pxm * 1.1)}px system-ui`;
+  ctx.fillText(`t = ${simTime.toFixed(1)} s   balls: ${balls.length}${paused ? '   ⏸ paused' : ''}`, 10, 20);
+}
+
+// ---------- stats ----------
+const statsEl = document.getElementById('stats');
+function fmtStats() {
+  const b = selected;
+  if (!b) { statsEl.innerHTML = '<div><span class="k">—</span><span>drop a ball</span></div>'; return; }
+  const v = Math.hypot(b.vx, b.vy);
+  const ke = 0.5 * b.mass * v * v, ker = 0.5 * b.I * b.w * b.w;
+  const pe = b.mass * P.g * b.y;
+  const rows = [
+    ['state', b.contact], ['mass', b.mass.toFixed(0) + ' kg'],
+    ['speed', v.toFixed(2) + ' m/s'], ['spin', b.w.toFixed(2) + ' rad/s'],
+    ['KE trans', (ke / 1000).toFixed(2) + ' kJ'], ['KE rot', (ker / 1000).toFixed(2) + ' kJ'],
+    ['PE', (pe / 1000).toFixed(2) + ' kJ'], ['E total', ((ke + ker + pe) / 1000).toFixed(2) + ' kJ'],
+  ];
+  statsEl.innerHTML = rows.map(([k, val]) => `<div><span class="k">${k}</span><span>${val}</span></div>`).join('');
+}
+
+// ---------- main loop ----------
+let last = performance.now(), acc = 0;
+function frame(now) {
+  const elapsed = Math.min(0.1, (now - last) / 1000); last = now;
+  if (!paused) {
+    acc += elapsed * P.speed;
+    while (acc >= DT) {
+      for (const b of balls) stepBall(b);
+      ballPairs();
+      simTime += DT; acc -= DT;
+    }
+  }
+  draw(); fmtStats();
+  requestAnimationFrame(frame);
+}
+
+// ---------- input ----------
+let drag = null, dragNow = null;
+function toWorld(ev) {
+  const r = cv.getBoundingClientRect();
+  return { x: (ev.clientX - r.left) / r.width * W,
+           y: VIEW_H - (ev.clientY - r.top) / r.height * VIEW_H };
+}
+cv.addEventListener('pointerdown', ev => {
+  const p = toWorld(ev);
+  for (const b of balls) if (Math.hypot(b.x - p.x, b.y - p.y) <= b.r + 0.2) { selected = b; return; }
+  drag = p; dragNow = p; cv.setPointerCapture(ev.pointerId);
+});
+cv.addEventListener('pointermove', ev => { if (drag) dragNow = toWorld(ev); });
+cv.addEventListener('pointerup', ev => {
+  if (!drag) return;
+  const p = toWorld(ev);
+  const vx = (p.x - drag.x) * 2.5, vy = (p.y - drag.y) * 2.5;
+  const cap = Math.hypot(vx, vy), maxV = 40, k = cap > maxV ? maxV / cap : 1;
+  const y0 = Math.max(drag.y, terrainH(drag.x) + P.radius + 0.01);
+  makeBall(drag.x, y0, vx * k, vy * k);
+  drag = dragNow = null;
+});
+window.addEventListener('keydown', ev => {
+  if (ev.code === 'Space' && ev.target === document.body) { ev.preventDefault(); togglePause(); }
+});
+
+// ---------- UI bindings ----------
+const $ = id => document.getElementById(id);
+function bindRange(id, key, fmt) {
+  $(id).addEventListener('input', () => { P[key] = +$(id).value; $(id + 'v').textContent = fmt(P[key]); });
+}
+bindRange('g', 'g', v => v.toFixed(2) + ' m/s²');
+bindRange('rho', 'rho', v => v.toFixed(2) + ' kg/m³');
+bindRange('speed', 'speed', v => v.toFixed(1) + '×');
+bindRange('rad', 'radius', v => v.toFixed(2) + ' m');
+bindRange('mu', 'mu', v => v.toFixed(2));
+bindRange('rest', 'e', v => v.toFixed(2));
+bindRange('crr', 'crr', v => v.toFixed(3));
+$('gpreset').addEventListener('change', () => {
+  P.g = +$('gpreset').value; $('g').value = P.g; $('gv').textContent = P.g.toFixed(2) + ' m/s²';
+});
+$('mat').addEventListener('change', () => {
+  P.mat = $('mat').value;
+  const m = MATERIALS[P.mat];
+  P.mu = m.mu; P.e = m.e; P.crr = m.crr;
+  $('mu').value = m.mu; $('muv').textContent = m.mu.toFixed(2);
+  $('rest').value = m.e; $('restv').textContent = m.e.toFixed(2);
+  $('crr').value = m.crr; $('crrv').textContent = m.crr.toFixed(3);
+});
+$('terrain').addEventListener('change', () => { P.terrain = $('terrain').value; });
+$('trails').addEventListener('change', () => {
+  P.trails = $('trails').checked;
+  if (!P.trails) for (const b of balls) b.trail.length = 0;
+});
+$('drop').addEventListener('click', () => {
+  const x = P.terrain === 'valley' ? 4 : 3;
+  makeBall(x, terrainH(x) + P.radius + 0.05, 0, 0);
+});
+function togglePause() { paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause'; }
+$('pause').addEventListener('click', togglePause);
+$('clear').addEventListener('click', () => { balls = []; selected = null; simTime = 0; });
+
+resize();
+requestAnimationFrame(frame);
+</script>

@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── project-specific ──────────────────────────────
+# experiment data (stays local)
+bridge/results/
+bridge/memory/
+
+# future large artifacts
+data/
+checkpoints/
