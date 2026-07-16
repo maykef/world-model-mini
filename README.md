@@ -70,7 +70,44 @@ Model comparison on one GPU: run the benchmark, switch the served model, run it 
 - `hill2d.html` is the original 2D prototype, kept for quick physics experiments.
 - See `STATUS.md` for current state and decisions, `CLAUDE.md` for conventions and standing instructions.
 
+## Learned world model (`bridge/worldmodel/`)
+
+Memory answers *"what did I find at cell X"*; the world model answers *"what would
+happen if I did Y"* — including in places the agent has never stood. A small MLP
+(13 features → 2 targets, ~35k params, CPU-only by design so it never touches the
+LLM's VRAM) learns the **dynamics/cost function**: given local slopes, commanded
+heading+speed, wading flag and metabolic scale, predict `[Δenergy, displacement]`
+for one 2-second step. It deliberately does **not** predict terrain at unseen
+coordinates — the planner flags those paths as out-of-distribution instead.
+
+- **Data**: `collect_data.js` extracts the sim's physics verbatim (file untouched)
+  and generates seeded episodes with held 2 s actions — 6.2k real transitions over
+  13 world configs. `dataset.py` builds episode-split (never row-split) train/val/test.
+- **Accuracy** (held-out test): Δenergy MAE **2.9 kJ** (target std 16.8), displacement
+  MAE **0.26 m** (std 1.14). Autoregressive rollout error *saturates* instead of
+  compounding: 2.9 → 6.0 → 7.7 → 8.1 kJ at K = 1/3/5/10 steps (`plots/`).
+- **Planner** (`planner.py`): for each candidate heading (8 compass + food bearings)
+  roll the model ~3 steps; step 1 uses observed slopes, later steps use the agent's
+  own world-map cells; leaving explored territory raises an OOD flag. ~1 ms per plan.
+- **Integration**: `mind_driver.py --worldmodel` injects a compact per-heading
+  prediction block into the prompt. Flag-gated, additive; protocol and physics untouched.
+
+**Ablation** (same seeds: perlin:1337, food seeds 777–779, 3×240 s, metab 15×,
+memory wiped per condition; `ablation.py`):
+
+| condition | survival | mean survived (s) | mean eaten | mean final kJ | latency (s) |
+|---|---|---|---|---|---|
+| heuristic (mock)   | 50 % | 144 | 2.3 | 192 | 0.0 |
+| qwen3.5, no WM     | 50 % | 137 | 1.5 | 271 | 4.1 |
+| qwen3.5, **+WM**   | **67 %** | **188** | 1.8 | **364** | 4.6 |
+
+With the world model the LLM survived more (both agents finishing alive twice),
+lived ~37 % longer, and banked ~34 % more final energy for +0.5 s decision latency.
+Honest caveats: n = 6 agent-episodes per condition — suggestive, not significant;
+and the bare LLM did *not* beat the heuristic on survival, so foresight (not raw
+intelligence) appears to be what pays here.
+
 ## Roadmap
 
-- Learned world model trained on the recorded decision traces (predict next state from state+action), then offered to the LLM as a planning tool
+- Scale the ablation (more seeds/episodes) and add the other two Delphi models
 - More agents + a communication channel (cooperation, gossip, emergent language) in a richer "real-like" world

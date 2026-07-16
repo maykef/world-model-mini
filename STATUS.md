@@ -56,8 +56,14 @@ The earlier 2D side-view version is kept as `hill2d.html`.
 
 - GitHub: `maykef/world-model-mini` (repo created by the user 2026-07-16; local git initialised the same day). Data dirs (`bridge/results/`, `bridge/memory/`, `venv/`) are gitignored — experiment data stays local.
 
+## Learned world model (2026-07-16, bridge/worldmodel/)
+
+Dynamics model (state, action) → [Δenergy, displacement] per 2 s step; MLP 13→128→128→2, CPU-only (never competes with Delphi's VRAM). Trained on 6.2k real transitions from `collect_data.js` (physics extracted verbatim from index.html — sim untouched), episode-split. **Test MAE 2.9 kJ / 0.26 m; rollout error saturates at ~8 kJ by K=10.** `planner.py` rolls candidates 3 steps (observed slopes → world-map cells → OOD flag on unexplored terrain, ~1 ms). `mind_driver.py --worldmodel` (default OFF) injects predictions into the prompt. Existing pre-worldmodel traces were synthetic protocol tests → quarantined in `results/protocol-tests/`.
+
+**Ablation** (3×240 s, perlin:1337, metab 15, identical seeds, fresh memory per condition): heuristic 50 % survival / 144 s mean; qwen3.5 without WM 50 % / 137 s; qwen3.5 **with WM 67 % / 188 s** and +34 % final energy, costing +0.5 s per decision (4.1→4.6 s). Small n (6 agent-episodes/condition) — suggestive, not significant. Notably bare qwen did not beat the heuristic; the planner is what moved the needle. Table: `bridge/worldmodel/ablation_1784212367.md`.
+
 ## Open decisions
-- [ ] Later: learn a world model *from* this simulation (record trajectories → train a predictor)?
+- [ ] Scale the world-model ablation (more seeds/episodes; gemma + xortron conditions).
 - [ ] Multi-agent communication channel (talk/collaborate/gossip) — the next step toward the "real-like" world.
 
 ## Done

@@ -260,6 +260,13 @@ class Driver:
         self.worldmem = WorldMemory(os.path.join(
             MEMORY_DIR, re.sub(r"[^A-Za-z0-9._-]", "_", str(self.tag)) + "__worldmap.json"))
         self.iteration = 0
+        self.done = None                        # set in main() for benchmark runs
+        self.planner = None
+        if getattr(args, "worldmodel", False):  # lazy: torch only loads when the flag is on
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "worldmodel"))
+            from planner import Planner
+            self.planner = Planner()
+            print("world-model planner loaded (bridge/worldmodel/model.pt)", flush=True)
         if not args.mock:
             from openai import AsyncOpenAI
             self.client = AsyncOpenAI(base_url=API_BASE, api_key="none")
@@ -284,29 +291,39 @@ class Driver:
                 f.write(json.dumps(record) + "\n")
 
     async def llm_decide(self, obs):
+        t0 = time.time()                        # total decision latency incl. planning
         name = obs.get("name", "Agent")
         hist = self.history.get(name, [])
         key = obs_terrain_key(obs)
         system = (SYSTEM_PROMPT.format(name=name)
                   + self.worldmem.render(name, key, obs.get("world_size_m", 50))
                   + self.journal_text(key))
+        if self.planner:
+            system += ("\n\nA PLANNER block may follow each observation: a learned dynamics model's "
+                       "prediction of energy cost and movement per candidate heading. It is usually "
+                       "accurate on explored terrain and unreliable where marked UNKNOWN TERRAIN.")
         msgs = [{"role": "system", "content": system}]
         for h_obs, h_act in hist[-3:]:          # short window: last 3 decisions
             msgs.append({"role": "user", "content": h_obs})
             msgs.append({"role": "assistant", "content": h_act})
         user = json.dumps(obs)
+        if self.planner:
+            cells = self.worldmem.maps.get(f"{name}|{key}", {}).get("cells", {})
+            try:
+                user += self.planner.render(self.planner.plan(obs, cells), obs)
+            except Exception as e:
+                print(f"  planner failed: {e}", flush=True)
         mem = self.memory.get(name)
         if mem:
             user += f'\nYour saved notes: "{mem}"'
         msgs.append({"role": "user", "content": user})
         async with self.llm_lock:
-            t0 = time.time()
             resp = await self.client.chat.completions.create(
                 model=self.model, messages=msgs,
                 temperature=0.0, max_tokens=self.args.max_tokens,
                 extra_body={"chat_template_kwargs": {"enable_thinking": self.args.think}},
             )
-            dt = time.time() - t0
+        dt = time.time() - t0
         text = resp.choices[0].message.content or ""
         act = parse_action(text)
         if act:
@@ -473,6 +490,8 @@ class Driver:
                 f" ate={x['eaten']} dist={x['dist_m']}m E={x['final_energy_kJ']}kJ"
                 for x in end["metrics"]), flush=True)
         print(f"benchmark complete -> {out}", flush=True)
+        if self.done and not self.done.done():
+            self.done.set_result(True)          # benchmark runs exit when finished
 
 
 async def main():
@@ -491,6 +510,8 @@ async def main():
     ap.add_argument("--metab", type=int, default=10)
     ap.add_argument("--think", action="store_true", help="enable model reasoning/thinking")
     ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--worldmodel", action="store_true",
+                    help="inject learned-dynamics planner predictions into the prompt")
     args = ap.parse_args()
 
     if args.probe:
@@ -502,10 +523,13 @@ async def main():
         return
 
     d = Driver(args)
+    d.done = asyncio.get_running_loop().create_future() if args.episodes else None
     print(f"mind_driver on ws://0.0.0.0:{args.port}  "
-          f"({'MOCK policy' if args.mock else 'model: ' + str(d.model)})", flush=True)
+          f"({'MOCK policy' if args.mock else 'model: ' + str(d.model)})"
+          f"{'  [worldmodel ON]' if d.planner else ''}", flush=True)
     async with websockets.serve(d.handle, "0.0.0.0", args.port, max_size=2**22):
-        await asyncio.Future()
+        await (d.done if d.done else asyncio.Future())
+    print("benchmark finished — exiting", flush=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
