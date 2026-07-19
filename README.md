@@ -67,6 +67,16 @@ Model comparison on one GPU: run the benchmark, switch the served model, run it 
 
 - **Physics is testable headless**: everything above the `// ===== rendering` marker in the app script is DOM- and THREE-free. Extract it, append assertions, run with `node`. All mechanics in this repo were verified that way (rolling speed vs. theory, energy monotonicity, buoyancy equilibrium vs. Archimedes, Minetti cost ratios, food-layout determinism).
 - **Rendering is testable headless** too: `chromium --headless=new --use-angle=swiftshader --enable-unsafe-swiftshader --screenshot=…`.
+- **Egocentric vision self-tests** (Phase 1 pixel perception), both wall-clock-independent (fixed-step, no RAF):
+  - Frame capture — asserts a non-trivial JPEG at the right dimensions:
+    `chromium --headless=new --use-angle=swiftshader --enable-unsafe-swiftshader --dump-dom 'file://$HOME/…/index.html?selftest=vision'` → `<title>` reports `w=448 h=448 bytes=… OK`; add `--screenshot=ego.png` to eyeball the first-person frame.
+    (Snap Chromium is confined to `$HOME` — copy the self-contained `index.html` there first.)
+  - Determinism — vision on vs off must be byte-identical physics: run `?selftest=traj&vision=0` and `?selftest=traj&vision=1`, `--dump-dom`, diff the `<pre id="out">` trajectory dumps (agent x/y/z + energy per sim-second). Frame capture is render-only and never writes sim state, so they match exactly.
+  - Live use: `?vision=1` turns the 👁 Vision regime on at load (PiP viewports top-right); the driver can also request it per-episode via the reset `cfg` (`vision`/`regime`).
+- **Terrain shading configs** (`?render=naturalistic|bands|bands%2Bcontours`, or the World-card "Shading" selector): naturalistic tint · discrete cost bands at 10/25/40 % grade · bands + faint 2 m contours. All add a seeded ~1 m world-space ground texture. Shader-only (physics/determinism unaffected).
+- **Slope-probe perception benchmark** (does the render config help the VLM read slope?):
+  1. Generate a dataset (headless Chromium renders identical viewpoints per config with ground-truth grades): `venv/bin/python bridge/make_slope_probe.py --out data/slopeset --samples 30`
+  2. Score a served VLM: `venv/bin/python bridge/mind_driver.py --slope-probe data/slopeset` → MAE + Spearman rank-correlation per render config. `--mock` runs a blind baseline with no GPU. No episode logic involved.
 - `hill2d.html` is the original 2D prototype, kept for quick physics experiments.
 - See `STATUS.md` for current state and decisions, `CLAUDE.md` for conventions and standing instructions.
 

@@ -130,6 +130,25 @@ def test_analytic_planner_matches_engine_cost():
         oracle.close()
 
 
+def test_food_rollout_stops_at_food():
+    """Food-heading rollouts must stop AT the food, not bill the full horizon —
+    the ghost can't eat, so overshooting made adjacent food look like the worst
+    option (the groundhog analytic failure)."""
+    from planner import AnalyticPlanner
+    oracle = AnalyticPlanner()
+    try:
+        obs = _obs(5, 45, 400, 10.0)
+        obs["food"] = [{"bearing_deg": 90, "dist_m": 3.0, "elev_m": 0, "in_water": False}]
+        r = {c["heading_deg"]: c for c in oracle.plan(obs)}[90]
+        assert r["reaches_food"] and abs(r["disp_m"] - 3.0) < 0.2, r
+        no_food = _obs(5, 45, 400, 10.0)
+        full = {c["heading_deg"]: c for c in oracle.plan(no_food)}[90]
+        assert r["net_dE_kJ"] > full["net_dE_kJ"], (r, full)  # cheaper than full horizon
+        assert "REACHES food#0" in oracle.render(oracle.plan(obs), obs)
+    finally:
+        oracle.close()
+
+
 def test_paired_roles_counterbalance():
     """Both agents share one sim episode by construction; the runner must swap
     planner roles across episodes so spawn asymmetry cancels."""
@@ -160,6 +179,98 @@ def test_paired_roles_counterbalance():
     for i in range(3):
         d2.ep_idx = d3.ep_idx = i
         assert mind_driver.Driver.episode_cfg(d2, i) == mind_driver.Driver.episode_cfg(d3, i)
+
+
+def _driver(regime):
+    """A mock (GPU-free) Driver with the given observation regime."""
+    import argparse
+    sys.path.insert(0, os.path.join(HERE, ".."))
+    import mind_driver
+    args = argparse.Namespace(mock=True, planner="off", paired=False, worldmodel=False,
+                              episodes=0, seeds=None, seed=1, food_seed=1, terrain="perlin",
+                              size=50, water=0, metab=10, duration=60, food_interval=12,
+                              max_tokens=10, think=False, obs=regime, every_frame=False,
+                              image_detail="auto")
+    return mind_driver, mind_driver.Driver(args)
+
+
+def test_parse_action_sightings():
+    import mind_driver
+    a = mind_driver.parse_action(
+        'noise {"heading_deg": 90, "speed": 1.5, "reason": "go",'
+        ' "sightings": [{"type": "food", "est_x": 12.0, "est_z": 30.0, "confidence": 0.8}]} tail')
+    assert a["heading_deg"] == 90 and a["sightings"][0]["est_x"] == 12.0
+    # est_y is accepted as a z alias; heading wraps; speed clamps
+    a = mind_driver.parse_action('{"heading_deg": 370, "speed": 9, "sightings": [{"type": "r", "est_x": 1, "est_y": 2}]}')
+    assert a["heading_deg"] == 10 and a["speed"] == 2.0 and a["sightings"][0]["est_z"] == 2.0
+    # missing / malformed sightings are simply dropped, action still parses
+    assert "sightings" not in mind_driver.parse_action('{"heading_deg": 5}')
+    assert "sightings" not in mind_driver.parse_action('{"heading_deg": 5, "sightings": [{"type": "food"}]}')
+
+
+def test_pixel_regime_strips_oracle_and_attaches_image():
+    mind_driver, d = _driver("pixels+proprio")
+    obs = dict(mind_driver.PROBE_OBS)
+    frame = {"jpg_b64": mind_driver.SYNTH_JPEG_B64, "ts_sim": obs["t_s"] - 0.5, "seq": 1, "keyframe": True}
+    msgs, meta, _ = d.build_messages(obs, frame)
+    content = msgs[-1]["content"]
+    assert isinstance(content, list) and content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    text = content[0]["text"]
+    for leaked in ("slope_pct", "bearing_deg", "other_agent"):     # exteroception must be gone
+        assert leaked not in text, leaked
+    for kept in ("energy_pct", "heading_deg", "pos_m", "grade_ahead_pct", "wading"):  # interoception stays
+        assert kept in text, kept
+    assert meta["image_attached"] and meta["vision_staleness_s"] == 0.5
+    # minimal pixels regime omits position/gait
+    _, d2 = _driver("pixels")
+    t2 = d2.build_messages(obs, frame)[0][-1]["content"][0]["text"]
+    assert "pos_m" not in t2 and "grade_ahead_pct" not in t2
+
+
+def test_oracle_regime_unchanged():
+    mind_driver, d = _driver("oracle")
+    obs = dict(mind_driver.PROBE_OBS)
+    msgs, meta, _ = d.build_messages(obs, None)
+    assert isinstance(msgs[-1]["content"], str)                    # plain text, no image parts
+    assert json.dumps(obs) in msgs[-1]["content"]                  # full oracle obs is shown
+    assert not meta.get("image_attached")
+
+
+def test_keyframe_only_vs_every_frame():
+    mind_driver, d = _driver("pixels")
+    obs = dict(mind_driver.PROBE_OBS)
+    kf = {"jpg_b64": mind_driver.SYNTH_JPEG_B64, "ts_sim": 10.0, "seq": 1, "keyframe": True}
+    # first keyframe attaches
+    assert d.build_messages(obs, kf)[1]["image_attached"]
+    # same seq again -> no re-attach (keyframe-only default), belief goes stale
+    m = d.build_messages(obs, kf)[1]
+    assert not m["image_attached"] and m["vision_staleness_s"] == obs["t_s"] - 10.0
+    # a non-keyframe heartbeat does not attach by default...
+    hb = {"jpg_b64": mind_driver.SYNTH_JPEG_B64, "ts_sim": 11.0, "seq": 2, "keyframe": False}
+    assert not d.build_messages(obs, hb)[1]["image_attached"]
+    # ...but --every-frame forces it
+    d.args.every_frame = True
+    assert d.build_messages(obs, hb)[1]["image_attached"]
+
+
+def test_slope_probe_parsing_and_metrics():
+    import mind_driver as M
+    # parse the 6 grade slots, tolerating surrounding prose
+    got = M.parse_slopes('sure: {"ahead_5m": 22, "ahead_15m": -5, "left_5m": 9, '
+                         '"left_15m": 8, "right_5m": -21, "right_15m": -9} done')
+    assert got == {"ahead_5m": 22.0, "ahead_15m": -5.0, "left_5m": 9.0,
+                   "left_15m": 8.0, "right_5m": -21.0, "right_15m": -9.0}
+    assert M.parse_slopes("no json here") == {}
+    # Spearman: perfectly monotonic -> +1; reversed -> -1; ties averaged
+    assert abs(M._spearman([1, 2, 3, 4], [10, 20, 30, 40]) - 1.0) < 1e-9
+    assert abs(M._spearman([1, 2, 3, 4], [40, 30, 20, 10]) + 1.0) < 1e-9
+    assert M._rankdata([5, 5, 1]) == [2.5, 2.5, 1.0]           # tie -> average rank
+    assert M._spearman([1], [1]) is None                        # too few points
+    assert M._spearman([1, 1, 1], [1, 2, 3]) is None            # zero variance -> undefined
+    # mock estimates are deterministic and cover all six slots
+    m1, m2 = M.mock_slopes("AAAA"), M.mock_slopes("AAAA")
+    assert m1 == m2 and set(m1) == set(M.SLOPE_SLOTS)
 
 
 def test_trained_model_and_rollout_determinism():

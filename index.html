@@ -13,6 +13,13 @@
   #view canvas { border-radius: 10px; display: block; cursor: crosshair; }
   #hud { position: absolute; top: 10px; left: 14px; font-size: 12.5px; color: rgba(255,255,255,0.85);
          text-shadow: 0 1px 3px rgba(0,0,0,0.6); pointer-events: none; font-variant-numeric: tabular-nums; }
+  #pip { position: absolute; top: 10px; right: 10px; display: none; flex-direction: column; gap: 6px; pointer-events: none; }
+  #pip.on { display: flex; }
+  #pip .cam { width: 132px; background: rgba(13,15,19,0.8); border: 1px solid #2a303a; border-radius: 8px; padding: 4px; }
+  #pip .cam img { width: 124px; height: 124px; border-radius: 5px; display: block; background: #000; }
+  #pip .cam .lab { font-size: 10.5px; color: #cfd6df; display: flex; justify-content: space-between;
+                   padding: 2px 2px 3px; font-variant-numeric: tabular-nums; }
+  #pip .cam .kf { color: #44dd66; }
   .hint { color: #7c8695; font-size: 12px; margin-top: 6px; }
   .panel { flex: 0 0 268px; display: flex; flex-direction: column; gap: 10px; }
   .card { background: #1c2027; border: 1px solid #2a303a; border-radius: 10px; padding: 10px 12px; }
@@ -43,6 +50,10 @@
   <div class="stage">
     <div id="view"></div>
     <div id="hud"></div>
+    <div id="pip">
+      <div class="cam"><div class="lab"><span>Amber</span><span id="pipMeta0">—</span></div><img id="pipImg0" alt="Amber egocentric view"></div>
+      <div class="cam"><div class="lab"><span>Cyan</span><span id="pipMeta1">—</span></div><img id="pipImg1" alt="Cyan egocentric view"></div>
+    </div>
     <div class="hint">Drag (or one finger): rotate camera · wheel/pinch: zoom · right-drag: pan · click/tap terrain: drop ball · click a ball: select ·
       <b>Launch mode</b>: drag on terrain to aim a shot · Space: pause</div>
   </div>
@@ -59,6 +70,13 @@
           <option value="volcano">Volcano crater</option>
           <option value="bumpy">Bumpy field</option>
           <option value="perlin">Procedural (Perlin)</option>
+        </select>
+      </label>
+      <label class="row">Shading
+        <select id="renderCfg" class="full" title="Terrain shader for perception experiments">
+          <option value="naturalistic">Naturalistic</option>
+          <option value="bands">Cost bands (10/25/40%)</option>
+          <option value="bands+contours">Bands + contours (2 m)</option>
         </select>
       </label>
       <label class="row">Size<input type="range" id="size" min="50" max="300" step="10" value="50"><span class="val" id="sizev">50 m</span></label>
@@ -109,6 +127,7 @@
       <div class="btns" style="margin-bottom:6px">
         <button id="ctlBuiltin" class="on">🧠 Built-in</button>
         <button id="ctlLLM">🤖 LLM bridge</button>
+        <button id="ctlVision" title="Egocentric pixel perception (offscreen head cameras)">👁 Vision</button>
       </div>
       <label class="row" style="gap:4px">WS
         <input id="wsurl" type="text" style="flex:1;min-width:0;background:#262c36;color:#dfe4ea;border:1px solid #343c49;border-radius:7px;padding:4px 6px;font-size:11px">
@@ -1405,6 +1424,8 @@ const P = {
   agentsOn: true, metab: 10,                       // agents enabled; metabolic time-scale multiplier
   control: 'builtin',                              // 'builtin' heuristic or 'llm' via WebSocket bridge
   loop: false,                                     // Groundhog mode: repeat the identical episode
+  vision: false, regime: 'oracle',                 // egocentric pixel perception (Phase 1); regime label for logs
+  renderConfig: 'naturalistic',                    // terrain shader: naturalistic | bands | bands+contours
 };
 
 let balls = [], selected = null, simTime = 0, paused = false, colorIdx = 0;
@@ -1836,9 +1857,68 @@ function newTerrainGeo() {
   return g;
 }
 const terrainMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95, metalness: 0 });
+
+// Render-config uniforms (shader-only). uRenderMode: 0 naturalistic · 1 bands · 2 bands+contours.
+// Cost bands keyed to Minetti grade thresholds 10/25/40 % -> green / olive / brown / grey (linear-space).
+const RENDER_MODES = { naturalistic: 0, bands: 1, 'bands+contours': 2 };
+const BAND_LIN = [0x4d7c3f, 0x77803a, 0x6e5535, 0x8a8377]
+  .map(h => { const c = new THREE.Color(h).convertSRGBToLinear(); return new THREE.Vector3(c.r, c.g, c.b); });
+const terrainUniforms = {
+  uRenderMode:     { value: RENDER_MODES[P.renderConfig] || 0 },
+  uGroundSeed:     { value: P.pSeed % 997 },        // seeded, deterministic ground texture
+  uContourSpacing: { value: 2.0 },                  // isoline spacing, metres
+  uBandColor:      { value: BAND_LIN },
+};
+terrainMat.onBeforeCompile = (shader) => {
+  Object.assign(shader.uniforms, terrainUniforms);  // same uniform objects -> live updates
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nvarying vec3 vWPos;\nvarying vec3 vWNrm;')
+    .replace('#include <beginnormal_vertex>',
+             '#include <beginnormal_vertex>\n  vWNrm = normalize(mat3(modelMatrix) * objectNormal);')
+    .replace('#include <begin_vertex>',
+             '#include <begin_vertex>\n  vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', `#include <common>
+      varying vec3 vWPos; varying vec3 vWNrm;
+      uniform int uRenderMode; uniform float uGroundSeed; uniform float uContourSpacing; uniform vec3 uBandColor[4];
+      float h21(vec2 p, float s){ p += s; vec3 q = fract(vec3(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }
+      float vnoise(vec2 p, float s){ vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+        float a = h21(i, s), b = h21(i + vec2(1.,0.), s), c = h21(i + vec2(0.,1.), s), d = h21(i + vec2(1.,1.), s);
+        return mix(mix(a, b, u.x), mix(c, d, u.x), u.y); }`)
+    .replace('#include <color_fragment>', `#include <color_fragment>
+      {
+        float ny = clamp(abs(vWNrm.y), 0.05, 1.0);
+        float grade = sqrt(max(0.0, 1.0 - ny * ny)) / ny * 100.0;   // % grade from world normal
+        vec3 base = diffuseColor.rgb;                                // naturalistic = vertex colours
+        if (uRenderMode >= 1) {                                      // discrete cost bands
+          vec3 bc = uBandColor[0];
+          if (grade >= 10.0) bc = uBandColor[1];
+          if (grade >= 25.0) bc = uBandColor[2];
+          if (grade >= 40.0) bc = uBandColor[3];
+          base = bc;
+        }
+        // seeded ~1 m world-space ground texture (2 octaves) -> honest perspective foreshortening
+        float tex = 0.62 * vnoise(vWPos.xz, uGroundSeed) + 0.38 * vnoise(vWPos.xz * 2.7 + 7.0, uGroundSeed);
+        base *= 0.86 + 0.28 * tex;
+        if (uRenderMode >= 2) {                                      // faint 2 m isolines
+          float ez = vWPos.y / uContourSpacing;
+          float dline = abs(fract(ez + 0.5) - 0.5);                  // distance to nearest contour
+          float line = 1.0 - smoothstep(0.0, 1.5 * fwidth(ez), dline);
+          base *= mix(1.0, 0.6, line * 0.8);
+        }
+        diffuseColor.rgb = base;
+      }`);
+};
+
 const terrainMesh = new THREE.Mesh(newTerrainGeo(), terrainMat);
 terrainMesh.receiveShadow = true;
 scene.add(terrainMesh);
+function setRenderConfig(name) {
+  if (!(name in RENDER_MODES)) return;
+  P.renderConfig = name;
+  terrainUniforms.uRenderMode.value = RENDER_MODES[name];
+  const sel = document.getElementById('renderCfg'); if (sel && sel.value !== name) sel.value = name;
+}
 
 const cLow = new THREE.Color(0x4d7c3f).convertSRGBToLinear(),
       cHigh = new THREE.Color(0x9aa96b).convertSRGBToLinear(),
@@ -1868,6 +1948,7 @@ function rebuildTerrain() {
   }
   pos.needsUpdate = true; colAttr.needsUpdate = true;
   geo.computeBoundingSphere();
+  terrainUniforms.uGroundSeed.value = P.pSeed % 997;   // ground texture keyed to terrain seed
 }
 rebuildTerrain();
 
@@ -2005,8 +2086,128 @@ function syncAgents() {
   }
   for (const [a, m] of agentMeshes) if (!agents.includes(a)) {
     scene.remove(m.g);
+    if (a._vrt) { a._vrt.dispose(); a._vrt = null; }   // free the offscreen GPU target of a retired agent
     agentMeshes.delete(a);
   }
+}
+
+// ===== egocentric vision: per-agent head cameras -> offscreen JPEG frames (Phase 1) =====
+// Frame capture rides alongside the render loop; it only READS agent state and renders to an
+// offscreen target, never writing sim state or advancing the clock -> physics stays bit-identical
+// whether vision is on or off (Hard constraint #1).
+const FRAME_SIZE = 448;          // offscreen render-target edge, px (square)
+const FRAME_FOV = 100;           // egocentric field of view, deg
+const HEAD_HEIGHT = 1.7;         // camera height above ground contact, m
+const FRAME_QUALITY = 0.7;       // JPEG quality
+const VISION_CAPTURE_S = 1.0;    // min sim-seconds between capture attempts
+const MAX_FRAME_AGE_S = 2.0;     // force a (heartbeat) frame if this much sim-time since last sent
+const LUMA_THRESH = 6;           // mean abs 8-bit luma diff (0-255) that counts as "scene changed"
+const THUMB = 32;                // luma thumbnail edge used for keyframe gating
+
+let visionCaptureAt = 0, visionFramesSent = 0, _vPrevBalls = 0;
+const _encCanvas = document.createElement('canvas');
+_encCanvas.width = _encCanvas.height = FRAME_SIZE;
+const _encCtx = _encCanvas.getContext('2d');
+const _encImg = _encCtx.createImageData(FRAME_SIZE, FRAME_SIZE);
+const _pxBuf = new Uint8Array(FRAME_SIZE * FRAME_SIZE * 4);
+
+function agentVision(a) {                    // lazily attach the head camera + render target
+  if (!a._vcam) {
+    a._vcam = new THREE.PerspectiveCamera(FRAME_FOV, 1, 0.05, 400);
+    a._vrt = new THREE.WebGLRenderTarget(FRAME_SIZE, FRAME_SIZE,
+      { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+    a._vseq = 0; a._vSent = 0; a._vLastSentT = -1e9; a._vSentThumb = null;
+    a._vPrevEaten = a.eaten; a._vPrevAlive = a.alive; a._frame = null; a._vForce = true;
+  }
+  return a;
+}
+
+// pose derives entirely from agent state each tick -> the ego camera cannot drift from the body.
+// GRAVITY-STABILIZED: world-up + horizontal optical axis => the horizon stays level and centred,
+// never pitching or rolling with the terrain the agent stands on (like a vestibular-stabilized gaze).
+function aimAgentCamera(a) {
+  const c = a._vcam;
+  const ux = Math.cos(a.heading), uz = Math.sin(a.heading);
+  c.position.set(a.p.x, a.p.y + HEAD_HEIGHT, a.p.z);
+  c.up.set(0, 1, 0);                                          // gravity up -> no roll
+  c.lookAt(a.p.x + ux, a.p.y + HEAD_HEIGHT, a.p.z + uz);      // level gaze -> horizon at frame centre
+  c.updateMatrixWorld();
+}
+
+function encodeFrame() {                     // WebGL buffer is bottom-up -> flip into top-down ImageData
+  const d = _encImg.data, N = FRAME_SIZE;
+  for (let y = 0; y < N; y++) {
+    const src = (N - 1 - y) * N * 4, dst = y * N * 4;
+    d.set(_pxBuf.subarray(src, src + N * 4), dst);
+  }
+  _encCtx.putImageData(_encImg, 0, 0);
+  return _encCanvas.toDataURL('image/jpeg', FRAME_QUALITY);
+}
+
+function lumaThumb() {                        // THUMB x THUMB luma grid sampled from the full buffer
+  const N = FRAME_SIZE, step = N / THUMB, t = new Uint8Array(THUMB * THUMB);
+  for (let ty = 0; ty < THUMB; ty++) for (let tx = 0; tx < THUMB; tx++) {
+    const sx = Math.min(N - 1, (tx * step) | 0), sy = Math.min(N - 1, (ty * step) | 0);
+    const i = (sy * N + sx) * 4;
+    t[ty * THUMB + tx] = (_pxBuf[i] * 77 + _pxBuf[i + 1] * 150 + _pxBuf[i + 2] * 29) >> 8;
+  }
+  return t;
+}
+
+function thumbDiff(a, b) {
+  if (!a || !b) return Infinity;
+  let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
+  return s / a.length;
+}
+
+// Render each alive agent's egocentric view, gate on scene change / age / discrete events, and
+// stash the newest sendable frame on a._frame for the next observation message.
+function captureAgentFrames(force) {
+  const nb = balls.length, ballEvent = nb !== _vPrevBalls; _vPrevBalls = nb;  // food spawn/consumed nearby
+  const prevTarget = renderer.getRenderTarget();
+  for (const a of agents) {
+    if (!a.alive) continue;
+    agentVision(a);
+    if (a.eaten !== a._vPrevEaten) { a._vForce = true; a._vPrevEaten = a.eaten; }  // ate in view
+    if (a.alive !== a._vPrevAlive) { a._vForce = true; a._vPrevAlive = a.alive; }
+    if (ballEvent) a._vForce = true;
+    aimAgentCamera(a);
+    const mine = agentMeshes.get(a), wasVis = mine ? mine.g.visible : true;
+    if (mine) mine.g.visible = false;                   // don't stare at your own body
+    renderer.setRenderTarget(a._vrt);
+    renderer.render(scene, a._vcam);
+    renderer.readRenderTargetPixels(a._vrt, 0, 0, FRAME_SIZE, FRAME_SIZE, _pxBuf);
+    if (mine) mine.g.visible = wasVis;
+    const dataURI = encodeFrame(), thumb = lumaThumb(), idx = a.idx;
+    const img = $('pipImg' + idx); if (img) img.src = dataURI;   // PiP preview: every capture
+    const age = simTime - a._vLastSentT;
+    const changed = thumbDiff(thumb, a._vSentThumb) > LUMA_THRESH;
+    const event = a._vForce || force;
+    if (event || changed || age >= MAX_FRAME_AGE_S) {
+      a._vseq++;
+      const keyframe = event || changed;               // age-only heartbeat is not a keyframe
+      a._frame = { jpg_b64: dataURI.slice(dataURI.indexOf(',') + 1),
+                   ts_sim: Math.round(simTime * 100) / 100, seq: a._vseq, keyframe };
+      a._vSentThumb = thumb; a._vLastSentT = simTime; a._vForce = false;
+      const meta = $('pipMeta' + idx);
+      if (meta) meta.innerHTML = `#${a._vseq} ` + (keyframe ? '<span class="kf">&#9670;KEY</span>' : '&middot;hb');
+    }
+  }
+  renderer.setRenderTarget(prevTarget);
+}
+
+function resetVision() {                      // new life / respawn: fresh capture state, keyframe on start
+  visionCaptureAt = 0; _vPrevBalls = balls.length; visionFramesSent = 0;
+  for (const a of agents) { if (a._vrt) a._vrt.dispose(); a._vcam = null; a._frame = null; }
+  if (P.vision && agents.length) captureAgentFrames(true);
+}
+
+function setVision(on) {
+  P.vision = on;
+  P.regime = on ? (P.regime === 'oracle' ? 'pixels_proprio' : P.regime) : 'oracle';
+  $('ctlVision').classList.toggle('on', on);
+  $('pip').classList.toggle('on', on);
+  if (on) { for (const a of agents) { agentVision(a); a._vForce = true; } visionCaptureAt = 0; captureAgentFrames(true); }
 }
 
 // ===== WebSocket bridge (external AI control) =====
@@ -2047,10 +2248,15 @@ function applyReset(cfg) {
   if (P.terrain === 'perlin') findPerlinPeak();
   applyWorldSize();
   $('waterv').textContent = fmtWater(P.water);
+  if (cfg.render) setRenderConfig(cfg.render);
+  if (cfg.regime) P.regime = cfg.regime;
+  if (cfg.vision != null) setVision(!!cfg.vision);
+  else if (cfg.regime && cfg.regime !== 'oracle') setVision(true);
   balls = []; selected = null; simTime = 0; nextObsAt = 0; colorIdx = 0;
   spawnAgents();
   for (const a of agents) a.external = P.control === 'llm';
   clearTrails(); syncMeshes(); syncAgents();
+  resetVision();
   beginEpisode(cfg);
   selected = null;
   paused = false; $('pause').textContent = 'Pause';
@@ -2180,6 +2386,7 @@ $('terrain').addEventListener('change', () => {
   rebuildTerrain();
   clearTrails();
 });
+$('renderCfg').addEventListener('change', () => setRenderConfig($('renderCfg').value));
 function regenPerlin() {
   noise2 = buildNoise(P.pSeed);
   if (P.terrain === 'perlin') { findPerlinPeak(); rebuildTerrain(); clearTrails(); }
@@ -2241,6 +2448,7 @@ $('respawn').addEventListener('click', () => {
 });
 $('ctlBuiltin').addEventListener('click', () => setControl('builtin'));
 $('ctlLLM').addEventListener('click', () => setControl('llm'));
+$('ctlVision').addEventListener('click', () => setVision(!P.vision));
 let loopCfg = null;
 $('loop').addEventListener('change', () => {
   P.loop = $('loop').checked;
@@ -2314,13 +2522,26 @@ function frame(now) {
   }
   syncMeshes();
   syncAgents();
+  // egocentric frame capture (render-only; never mutates sim state) at its own sim-time cadence
+  if (P.vision && !paused && simTime >= visionCaptureAt) {
+    captureAgentFrames(false);
+    visionCaptureAt = simTime + VISION_CAPTURE_S;
+  }
   // stream observations to the external mind at 0.5 Hz sim-time
   if (P.control === 'llm' && ws && ws.readyState === 1 && simTime >= nextObsAt) {
     nextObsAt = simTime + 2;
     wsSend({
       type: 'obs', t_s: Math.round(simTime * 10) / 10, iteration,
       episode_active: !!(episode && episode.active),
-      agents: agents.map((a, i) => ({ id: i, alive: a.alive, obs: a.alive ? buildObs(a) : null })),
+      agents: agents.map((a, i) => {
+        const ob = a.alive ? buildObs(a) : null;
+        if (ob && P.vision) { ob.regime = P.regime; ob.oracle_hidden = true; }  // self-describing; oracle stays for GT logging
+        const entry = { id: i, alive: a.alive, obs: ob };
+        if (P.vision && a.alive && a._frame) {           // attach newest gated frame, then consume it
+          entry.frame = a._frame; a._frame = null; a._vSent++; visionFramesSent++;
+        }
+        return entry;
+      }),
     });
   }
   // episode termination: time limit or all agents dead
@@ -2362,7 +2583,9 @@ function frame(now) {
     camera.position.x += dx; camera.position.y += dy; camera.position.z += dz;
   }
   hudEl.textContent = `t = ${simTime.toFixed(1)} s   balls: ${balls.length}   world: ${W}×${D} m`
-    + (P.loop ? `   🔁 iter ${iteration}` : '') + (paused ? '   ⏸ paused' : '');
+    + (P.loop ? `   🔁 iter ${iteration}` : '')
+    + (P.vision ? `   👁 frames sent A:${agents[0] ? agents[0]._vSent || 0 : 0} C:${agents[1] ? agents[1]._vSent || 0 : 0}` : '')
+    + (paused ? '   ⏸ paused' : '');
   fmtStats();
   controls.update();
   renderer.render(scene, camera);
@@ -2395,11 +2618,101 @@ pollStats();
 
 spawnAgents();
 $('wsurl').value = defaultWsUrl();
-// URL params for headless/scripted runs: ?control=llm&ws=ws://127.0.0.1:8390
+// URL params for headless/scripted runs: ?control=llm&ws=ws://127.0.0.1:8390&vision=1
 {
   const q = new URLSearchParams(location.search);
   if (q.get('ws')) $('wsurl').value = q.get('ws');
+  if (q.get('render')) setRenderConfig(q.get('render'));
+  if (q.get('vision') === '1') setVision(true);
   if (q.get('control') === 'llm') setControl('llm');
+
+  // Headless self-tests: fixed-step the world (wall-clock-independent) and report to <title>/<pre>.
+  //   ?selftest=vision  -> capture one egocentric frame; DECODE the JPEG, assert 448x448 + non-degenerate
+  //   ?selftest=traj    -> dump the agent trajectory (compare vision=0 vs vision=1 for determinism)
+  const st = q.get('selftest');
+  if (st === 'vision') {
+    // realistic scene: perlin terrain + a full preset food layout (what real episodes look like)
+    applyReset({ terrain: 'perlin', seed: 1337, size: 50, vision: true,
+                 food_mode: 'preset', food_count: 12, food_seed: 777, episode_s: 0 });
+    for (let i = 0; i < 240 * 3; i++) stepWorld();       // 3 sim-seconds, no RAF dependency
+    syncMeshes(); syncAgents(); captureAgentFrames(true);
+    const a = agents[0], b64 = a._frame ? a._frame.jpg_b64 : '';
+    const bytes = Math.floor(b64.length * 3 / 4);         // telemetry only — NOT an assertion
+    const report = (msg, ok) => {
+      document.title = msg + ' ' + (ok ? 'OK' : 'FAIL');
+      document.body.innerHTML =
+        `<div id="out" style="font:15px monospace;color:${ok ? '#4d4' : '#f55'};background:#111;padding:8px">${document.title}</div>`
+        + `<img alt="ego" src="data:image/jpeg;base64,${b64}" style="width:448px;height:448px;border:1px solid #333;image-rendering:auto">`;
+    };
+    const img = new Image();
+    img.onload = () => {
+      // decode the JPEG and check content, not byte count
+      const dimsOK = img.naturalWidth === FRAME_SIZE && img.naturalHeight === FRAME_SIZE;
+      const S = 64, cv = document.createElement('canvas'); cv.width = cv.height = S;
+      const cx = cv.getContext('2d'); cx.drawImage(img, 0, 0, S, S);
+      const d = cx.getImageData(0, 0, S, S).data, n = S * S, uniq = new Set();
+      let sr = 0, sg = 0, sb = 0, sr2 = 0, sg2 = 0, sb2 = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        uniq.add((d[i] >> 3 << 10) | (d[i + 1] >> 3 << 5) | (d[i + 2] >> 3));   // ~5-bit/channel quantise
+        sr += d[i]; sg += d[i + 1]; sb += d[i + 2];
+        sr2 += d[i] * d[i]; sg2 += d[i + 1] * d[i + 1]; sb2 += d[i + 2] * d[i + 2];
+      }
+      const maxVar = Math.max(sr2 / n - (sr / n) ** 2, sg2 / n - (sg / n) ** 2, sb2 / n - (sb / n) ** 2);
+      const nonDegen = uniq.size >= 64 || maxVar > 4;     // uniform sky/black frame fails both; terrain passes
+      report(`VISION w=${img.naturalWidth} h=${img.naturalHeight} bytes=${bytes} uniq=${uniq.size} maxvar=${maxVar.toFixed(1)}`,
+             dimsOK && nonDegen);
+    };
+    img.onerror = () => report(`VISION decode-failed bytes=${bytes}`, false);
+    img.src = 'data:image/jpeg;base64,' + b64;
+  } else if (st === 'traj') {
+    const vis = q.get('vision') === '1';
+    if (vis) setVision(true);
+    const log = [];
+    for (let s = 0; s < 30; s++) {
+      for (let i = 0; i < 240; i++) stepWorld();
+      if (vis) { syncMeshes(); syncAgents(); captureAgentFrames(false); }
+      // quantise to 0.1 mm / 1 J so float formatting can't create spurious diffs
+      log.push(agents.map(a => [Math.round(a.p.x * 1e4), Math.round(a.p.y * 1e4),
+                                Math.round(a.p.z * 1e4), Math.round(a.energy)]));
+    }
+    document.title = 'TRAJ ' + (vis ? 'vision=1' : 'vision=0');
+    document.body.innerHTML = `<pre id="out">${JSON.stringify(log)}</pre>`;
+  } else if (st === 'slopeset') {
+    // Slope-probe dataset: fixed (deterministic, seed-4242) viewpoints on perlin terrain, captured
+    // for the current render config, with ground-truth grade ahead/left/right at 5 m & 15 m.
+    // Same viewpoints across configs (only the shader differs) -> fair per-config comparison.
+    const N = Math.max(1, Math.min(64, +(q.get('samples') || 12)));
+    applyReset({ terrain: 'perlin', seed: 1337, size: 50, episode_s: 0 });
+    balls = []; selected = null; syncMeshes();
+    for (const a of agents) { const m = agentMeshes.get(a); if (m) m.g.visible = false; }  // no bodies in view
+    const a0 = agents[0]; agentVision(a0);
+    const rng = mulberry32(4242), mg = 16 * W / 50, samples = [];
+    const dirsFor = h => ({ ahead: [Math.cos(h), Math.sin(h)],
+                            left:  [Math.cos(h + Math.PI / 2), Math.sin(h + Math.PI / 2)],
+                            right: [Math.cos(h - Math.PI / 2), Math.sin(h - Math.PI / 2)] });
+    const prevTarget = renderer.getRenderTarget();
+    for (let i = 0; i < N; i++) {
+      const x = mg + rng() * (W - 2 * mg), z = mg + rng() * (D - 2 * mg), h = rng() * Math.PI * 2;
+      a0.p.x = x; a0.p.z = z; a0.p.y = terrainH(x, z); a0.heading = h;
+      aimAgentCamera(a0);
+      renderer.setRenderTarget(a0._vrt);
+      renderer.render(scene, a0._vcam);
+      renderer.readRenderTargetPixels(a0._vrt, 0, 0, FRAME_SIZE, FRAME_SIZE, _pxBuf);
+      const uri = encodeFrame(), gt = {};
+      for (const [k, d] of Object.entries(dirsFor(h))) {                 // avg grade % over the run
+        gt[k + '_5m'] = Math.round(gradeAhead(x, z, d[0], d[1], 5) * 100);
+        gt[k + '_15m'] = Math.round(gradeAhead(x, z, d[0], d[1], 15) * 100);
+      }
+      samples.push({ jpg_b64: uri.slice(uri.indexOf(',') + 1),
+                     pos: [Math.round(x * 10) / 10, Math.round(z * 10) / 10],
+                     heading_deg: Math.round(compassFromXZ(Math.cos(h), Math.sin(h))), gt });
+    }
+    renderer.setRenderTarget(prevTarget);
+    document.title = `SLOPESET ${P.renderConfig} n=${samples.length}`;
+    document.body.innerHTML = `<pre id="out">${JSON.stringify(
+      { config: P.renderConfig, terrain: 'perlin', seed: 1337, size: W, samples })}</pre>`;
+  } else {
+    requestAnimationFrame(frame);
+  }
 }
-requestAnimationFrame(frame);
 </script>
