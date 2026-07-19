@@ -142,6 +142,36 @@ def paired_analysis(rows):
     return result
 
 
+def learning_curve(rows, early_n=4, late_n=4):
+    """Groundhog runs: does performance improve across identical lives?
+    Per condition: early-episodes vs late-episodes means + bootstrap CI on the
+    late-minus-early difference (per agent-episode)."""
+    out = {}
+    by = {}
+    for r in rows:
+        by.setdefault(r["condition"], []).append(r)
+    for cond, rs in by.items():
+        eps = sorted({r["episode"] for r in rs})
+        if len(eps) < early_n + late_n:
+            continue
+        early = [r for r in rs if r["episode"] in eps[:early_n]]
+        late = [r for r in rs if r["episode"] in eps[-late_n:]]
+        c = {"episodes": len(eps), "per_iteration_survived_s": [
+            round(float(np.mean([r["survived_s"] for r in rs if r["episode"] == e])), 1)
+            for e in eps]}
+        for m in ["survived_s", "eaten", "final_energy_kJ"]:
+            ev = [r[m] for r in early]
+            lv = [r[m] for r in late]
+            rng = np.random.default_rng(SEED)
+            diffs = [np.mean(rng.choice(lv, len(lv))) - np.mean(rng.choice(ev, len(ev)))
+                     for _ in range(2000)]
+            c[m] = {"early_mean": float(np.mean(ev)), "late_mean": float(np.mean(lv)),
+                    "late_minus_early": float(np.mean(lv) - np.mean(ev)),
+                    "ci95": [float(np.percentile(diffs, 2.5)), float(np.percentile(diffs, 97.5))]}
+        out[cond] = c
+    return out
+
+
 def fmt_table(summary, title):
     lines = [f"\n# {title}", "",
              "| condition | n | survival [95% CI] | survived_s | final_kJ | eaten | dist_m | latency_s |",

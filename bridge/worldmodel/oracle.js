@@ -9,8 +9,11 @@
 //
 // Protocol: line-delimited JSON on stdin -> one JSON line on stdout per request.
 //   request:  {cfg:{terrain,seed,size,water,metab}, energy_kJ, x, z,
-//              candidates:[{heading_deg,...}], horizon_steps, step_s, speed}
+//              candidates:[{heading_deg, stop_at_m?, ...}], horizon_steps, step_s, speed}
 //   response: {results:[{heading_deg, net_dE_kJ, disp_m, steps, ood:false}]}
+// stop_at_m: end the rollout once the ghost has moved that far (food candidates —
+// the ghost world has no balls, so without this the quoted cost includes walking
+// past the food it would actually have eaten).
 
 const fs = require('fs');
 const path = require('path');
@@ -58,7 +61,11 @@ const service = `
       a.extAction = { heading: Math.atan2(d.z, d.x), speed };
       a.decideAt = Infinity;
       const x0 = a.p.x, z0 = a.p.z, e0 = a.energy;
-      for (let s = 0; s < H * subSteps && a.alive; s++) stepAgent(a);
+      const stopAt = cand.stop_at_m == null ? Infinity : cand.stop_at_m;
+      for (let s = 0; s < H * subSteps && a.alive; s++) {
+        stepAgent(a);
+        if (Math.hypot(a.p.x - x0, a.p.z - z0) >= stopAt) break;
+      }
       results.push({
         heading_deg: Math.round((cand.heading_deg || 0)),
         net_dE_kJ: Math.round((a.energy - e0) / 100) / 10,

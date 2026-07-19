@@ -38,18 +38,28 @@ def _attach_food(r, cand, obs):
     if cand["food_idx"] is not None:
         f = obs["food"][cand["food_idx"]]
         r["food_dist_m"] = f["dist_m"]
-        r["reaches_food"] = r["disp_m"] >= f["dist_m"]
+        r["reaches_food"] = r["disp_m"] + 0.1 >= f["dist_m"]
     return r
 
 
 def render(results, obs):
-    """Compact prompt block — identical for both planner sources by design."""
-    lines = ["\nPLANNER (world model) — predicted consequences over the "
-             "next ~6 s per heading (negative dE = energy spent):"]
+    """Compact prompt block — identical for both planner sources by design.
+
+    Food-heading rollouts STOP at the food, so their dE is the cost to reach it
+    — not the cost of overshooting it for the full horizon, which made adjacent
+    food look like the worst option (the groundhog analytic failure)."""
+    lines = ["\nPLANNER (world model) — predicted cost per heading, walking at "
+             f"{DEFAULT_SPEED} m/s for up to ~{HORIZON * STEP_S:.0f} s "
+             "(negative dE = energy spent; faster walking spends proportionally more per second):"]
     for r in sorted(results, key=lambda r: r["net_dE_kJ"], reverse=True):
         tag = ""
         if r.get("food_idx") is not None:
-            tag = f" → food#{r['food_idx']} ({obs['food'][r['food_idx']]['dist_m']} m away)"
+            f = obs["food"][r["food_idx"]]
+            if r.get("reaches_food"):
+                tag = (f" → REACHES food#{r['food_idx']} ({f['dist_m']} m away): "
+                       "dE is the full cost to get there; eating refills you")
+            else:
+                tag = f" → toward food#{r['food_idx']} ({f['dist_m']} m away, beyond this prediction)"
         unc = "  [UNKNOWN TERRAIN beyond {:.0f} m — unexplored]".format(r["disp_m"]) if r.get("ood") else ""
         lines.append(f"  heading {r['heading_deg']:>3}°: dE {r['net_dE_kJ']:+.1f} kJ, "
                      f"moves {r['disp_m']:.1f} m{tag}{unc}")
@@ -97,6 +107,8 @@ class LearnedPlanner:
             x, z = obs["pos_m"]["x"], obs["pos_m"]["z"]
             alt = obs["pos_m"]["alt"]
             energy = float(obs["energy_kJ"])
+            food_stop = (obs["food"][cand["food_idx"]]["dist_m"]
+                         if cand["food_idx"] is not None else None)
             net_e, net_d, steps, ood = 0.0, 0.0, 0, False
             for k in range(horizon):
                 if k == 0:
@@ -113,10 +125,19 @@ class LearnedPlanner:
                          *[obs["slope_pct"][d] for d in COMPASS],
                          speed, wading, metab]
                 de, disp = self._predict([feats])[0]
-                net_e += float(de)
-                net_d += float(disp)
-                x += ux * float(disp)
-                z += uz * float(disp)
+                de, disp = float(de), float(disp)
+                if food_stop is not None and disp > 0 and net_d + disp >= food_stop:
+                    # rollout stops AT the food: charge only the fraction of this
+                    # step needed to reach it, never the terrain beyond
+                    frac = max(0.0, (food_stop - net_d) / disp)
+                    net_e += de * frac
+                    net_d += disp * frac
+                    steps += 1
+                    break
+                net_e += de
+                net_d += disp
+                x += ux * disp
+                z += uz * disp
                 steps += 1
             r = {"heading_deg": round(h), "net_dE_kJ": round(net_e, 1),
                  "disp_m": round(net_d, 1), "steps": steps, "ood": ood,
@@ -156,6 +177,9 @@ class AnalyticPlanner:
                "water": (obs.get("water_level_m", 0) / (size / 50)) if obs.get("water_level_m", 0) else 0,
                "metab": obs.get("metabolic_scale", 10)}
         cands = candidates_for(obs)
+        for c in cands:                           # ghost can't eat: stop the rollout at the food
+            if c["food_idx"] is not None:
+                c["stop_at_m"] = obs["food"][c["food_idx"]]["dist_m"]
         results = self._ask({"cfg": cfg, "energy_kJ": obs["energy_kJ"],
                              "x": obs["pos_m"]["x"], "z": obs["pos_m"]["z"],
                              "candidates": cands, "horizon_steps": horizon,

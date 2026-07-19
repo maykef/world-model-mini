@@ -78,7 +78,8 @@ def run_condition(name, extra_flags, args):
            "--episodes", str(args.episodes), "--duration", str(args.duration),
            "--terrain", args.terrain, "--seeds", args.seeds,
            "--food-seed", str(args.food_seed), "--metab", str(args.metab),
-           "--size", str(args.size), "--port", str(port)] + extra_flags
+           "--size", str(args.size), "--port", str(port)] \
+        + (["--groundhog"] if getattr(args, "groundhog", False) else []) + extra_flags
     driver = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     time.sleep(2)
     if driver.poll() is not None:               # instant death (port conflict, crash): say why
@@ -127,6 +128,8 @@ def main():
     ap.add_argument("--metab", type=int, default=15)
     ap.add_argument("--size", type=int, default=50)
     ap.add_argument("--conditions", default="mock,off,learned,analytic")
+    ap.add_argument("--groundhog", action="store_true",
+                    help="identical world+food each episode; memory persists -> learning curves")
     ap.add_argument("--port", type=int, default=8390,
                     help="driver WS port — use distinct ports to run instances in parallel "
                          "(NOTE: only the CPU-only mock condition parallelises fairly; "
